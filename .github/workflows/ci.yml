@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# A newer push to the same ref makes the older run's answer irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build
+        run: cargo build --release
+      - name: test
+        run: cargo test
+
+  build-only:
+    name: build (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build
+        run: cargo build --release
+      # Windows builds but does not test, and that is the design, not an unfinished port.
+      #
+      # The gate asks the kernel "is any build holding this lock?" with a non-blocking
+      # flock(2). Windows has no flock, so the question cannot be answered, and the answer
+      # the tool gives is the fail-closed one: `apply` refuses with exit 3 and deletes
+      # nothing. `plan` stays fully usable everywhere, because reading a directory tree
+      # needs no lock. Running the suite here would only re-assert that boundary; the
+      # held-lock negative controls (the tests that prove a refusal removes zero bytes)
+      # need a real flock and therefore run on the two Unix legs above.
+      - name: note the flock boundary
+        run: echo "apply is refused on platforms without flock; see the gate module and README."

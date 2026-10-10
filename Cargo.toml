@@ -1,0 +1,13 @@
+[package]
+name = "cargogc"
+version = "0.1.0"
+edition = "2021"
+description = "Reclaim the cargo build caches cargo will never read again, with inode-honest accounting and a fail-closed build gate. The judgement is a build record, not an age."
+license = "MIT"
+repository = "https://github.com/LosEcher/cargogc"
+keywords = ["cargo", "cache", "incremental", "disk", "cleanup"]
+categories = ["development-tools", "command-line-utilities"]
+exclude = [".github/", "scripts/"]
+
+[dependencies]
+libc = "0.2"
