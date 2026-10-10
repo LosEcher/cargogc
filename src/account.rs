@@ -282,9 +282,16 @@ mod tests {
             items[0].freed_du < totals.logical,
             "a shared inode must not be reported as freed"
         );
-        assert_eq!(
-            items[0].freed_du, 0,
-            "the only large file is shared, so nothing is returned"
+        // Assert on the blob, not on a total that encodes one filesystem's layout: a
+        // directory's *own* inode block may legitimately be freed, and its size is
+        // filesystem-dependent — ubuntu CI measured 4096 B (ext4) where APFS reports 0.
+        // The first version of this test asserted `freed_du == 0` and went red on Linux
+        // only, which is exactly the class of assumption this suite must not contain.
+        assert!(
+            items[0].freed_du < 8192,
+            "the shared blob (8192 B) must not be credited as freed; at most a directory's \
+             own block may be (got {} bytes)",
+            items[0].freed_du
         );
         assert_eq!(totals.shared_inodes, 1);
         assert!(totals.shared_du > 0);

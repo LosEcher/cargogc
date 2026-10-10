@@ -1,6 +1,6 @@
 [package]
 name = "cargogc"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Reclaim the cargo build caches cargo will never read again, with inode-honest accounting and a fail-closed build gate. The judgement is a build record, not an age."
 license = "MIT"

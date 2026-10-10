@@ -71,6 +71,12 @@ incremental entries changed the *subtree* `du` by 9.82 GiB while the enclosing t
 — and an inode-level simulation — both said 8.55 GiB: the difference was `metadata.rmeta`
 files hardlinked from `deps/`. The path went away; the blocks did not.
 
+`freed` counts **directory inodes too**, and their block size is filesystem-dependent: a
+deleted directory's own block is real space that comes back, so ext4 (4 KiB per directory)
+reports slightly more than APFS (0). That is the more correct answer — but it means a test
+that pins an exact total is pinning a filesystem, which is how the first version of the
+hardlink test went red on Linux only. The suite now asserts on the blob it constructed.
+
 ## Usage
 
 ```console
