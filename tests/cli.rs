@@ -454,9 +454,33 @@ fn a_refused_apply_is_recorded_in_the_ledger() {
     drop(guard);
 
     assert_eq!(code, 3);
-    let runs = ledger::view(&ledger_path).unwrap();
+    let runs = ledger::view(&ledger_path).unwrap().runs;
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].verdict, "skipped");
+}
+
+/// A ledger shared with another writer must not read as an empty one.
+///
+/// Regression: the repo hook wrote its own summary lines into the same file cargogc is given,
+/// and `ledger --view` answered "no runs recorded" — true about cargogc's events, false about
+/// the ledger, and exactly the silent-no-op shape this tool exists to prevent.
+#[test]
+fn ledger_view_counts_records_it_did_not_write() {
+    let fixture = Fixture::new("foreign-ledger");
+    let ledger = fixture.root.join("runs.jsonl");
+    let foreign = r#"{"ts":"2026-10-10T15:35:10Z","op":"sweep","target":"/x","superseded":{"items":164,"bytes_du":9176412160},"verdict":"ok"}"#;
+    std::fs::write(&ledger, format!("{foreign}\n")).unwrap();
+
+    let (code, stdout, _stderr) = run(&["ledger", "--view", "--ledger", &ledger.to_string_lossy()]);
+    assert_eq!(code, 0, "a shared ledger is not an error: {stdout}");
+    assert!(
+        stdout.contains("ignored: 1 record(s) not written by cargogc"),
+        "foreign records must be counted: {stdout}"
+    );
+    assert!(
+        stdout.contains("no cargogc runs recorded"),
+        "the empty message must be qualified: {stdout}"
+    );
 }
 
 /// Acceptance 5: applying once leaves nothing for a second run with the same T.

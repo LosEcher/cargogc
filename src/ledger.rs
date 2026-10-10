@@ -383,26 +383,49 @@ pub struct RunView {
     pub interrupted: bool,
 }
 
+/// What a view found, including what it could not use.
+///
+/// `foreign` and `unparsable` exist so "no runs recorded" can never be printed over a file
+/// that demonstrably contains records: a ledger shared with another writer (measured
+/// 2026-10-10: the repo's build hook wrote summary lines next to cargogc's events, and the
+/// view reported "no runs recorded" while two sweeps had in fact reclaimed 10.81 GiB) must
+/// say so instead of reading as "nothing ever ran".
+#[derive(Debug, Default)]
+pub struct ViewOutcome {
+    pub runs: Vec<RunView>,
+    /// Parseable JSON lines that are not cargogc events (another writer's records).
+    pub foreign: usize,
+    /// Lines that are not JSON at all — a killed process leaves a truncated last line.
+    pub unparsable: usize,
+}
+
 /// view — fold the append-only log into one row per run.
 ///
-/// Malformed lines are skipped rather than fatal: a truncated final line is what a
-/// killed process leaves behind, and that is exactly the case this view exists to show.
-pub fn view(path: &Path) -> io::Result<Vec<RunView>> {
+/// Malformed lines are counted, not fatal: a truncated final line is what a killed process
+/// leaves behind, and that is exactly the case this view exists to show.
+pub fn view(path: &Path) -> io::Result<ViewOutcome> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok(ViewOutcome::default())
+        }
         Err(err) => return Err(err),
     };
 
     let mut order: Vec<String> = Vec::new();
     let mut rows: HashMap<String, RunView> = HashMap::new();
+    let mut foreign = 0usize;
+    let mut unparsable = 0usize;
 
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        let Ok(value) = parse(line) else { continue };
+        let Ok(value) = parse(line) else {
+            unparsable += 1;
+            continue;
+        };
         let evt = value
             .get("evt")
             .and_then(P::as_str)
@@ -517,14 +540,19 @@ pub fn view(path: &Path) -> io::Result<Vec<RunView>> {
                 }
                 rows.insert(run_id, row);
             }
-            _ => continue,
+            "" => foreign += 1,
+            _ => foreign += 1,
         }
     }
 
-    Ok(order
-        .into_iter()
-        .filter_map(|id| rows.remove(&id))
-        .collect())
+    Ok(ViewOutcome {
+        runs: order
+            .into_iter()
+            .filter_map(|id| rows.remove(&id))
+            .collect(),
+        foreign,
+        unparsable,
+    })
 }
 
 /// default_ledger_hint — the path a caller most likely wants, for error messages only.
@@ -634,7 +662,7 @@ mod tests {
         )
         .unwrap();
 
-        let rows = view(&path).unwrap();
+        let rows = view(&path).unwrap().runs;
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].verdict, "applied");
         assert_eq!(rows[0].items, 4);
@@ -648,8 +676,29 @@ mod tests {
     }
 
     #[test]
+    fn a_shared_ledger_reports_foreign_records_instead_of_looking_empty() {
+        // Measured 2026-10-10: a repo's build hook wrote its own summary lines next to
+        // cargogc's events, and the view printed "no runs recorded" while two sweeps had in
+        // fact reclaimed 10.81 GiB. "Nothing ran" and "nothing I wrote ran" must not look
+        // alike — that is the entire lesson of this project.
+        let dir = std::env::temp_dir().join(format!("cargogc-ledger-foreign-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("runs.jsonl");
+        let foreign = r#"{"ts":"2026-10-10T15:35:10Z","op":"sweep","target":"/x","superseded":{"items":164,"bytes_du":9176412160},"verdict":"ok"}"#;
+        fs::write(&path, format!("{foreign}\n{{\"evt\":\"start\"\n")).unwrap();
+
+        let outcome = view(&path).unwrap();
+        assert!(outcome.runs.is_empty(), "no cargogc events were written");
+        assert_eq!(outcome.foreign, 1, "the foreign summary line must be counted");
+        assert_eq!(outcome.unparsable, 1, "the truncated line must be counted");
+    }
+
+    #[test]
     fn view_of_a_missing_ledger_is_empty_not_an_error() {
         let path = std::env::temp_dir().join("cargogc-ledger-does-not-exist/runs.jsonl");
-        assert!(view(&path).unwrap().is_empty());
+        let outcome = view(&path).unwrap();
+        assert!(outcome.runs.is_empty());
+        assert_eq!(outcome.foreign, 0);
+        assert_eq!(outcome.unparsable, 0);
     }
 }

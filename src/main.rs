@@ -729,10 +729,17 @@ fn reconcile_lines(opts: &Opts, report: &Report) -> Result<Vec<String>, Fail> {
     let Some(path) = &opts.ledger else {
         return Ok(Vec::new());
     };
-    let runs = ledger::view(path).map_err(|err| {
+    let outcome = ledger::view(path).map_err(|err| {
         Fail::Runtime(format!("cannot read the ledger {}: {err}", path.display()))
     })?;
+    let runs = outcome.runs;
     let mut lines = vec![format!("reconcile (ledger {}):", path.display())];
+    if outcome.foreign > 0 {
+        lines.push(format!(
+            "note: {} record(s) in this ledger were not written by cargogc (ignored here)",
+            outcome.foreign
+        ));
+    }
     match runs
         .iter()
         .rev()
@@ -778,9 +785,10 @@ fn run_ledger_view(opts: &Opts) -> Result<(), Fail> {
                 .to_string(),
         ));
     };
-    let runs = ledger::view(path).map_err(|err| {
+    let outcome = ledger::view(path).map_err(|err| {
         Fail::Runtime(format!("cannot read the ledger {}: {err}", path.display()))
     })?;
+    let runs = outcome.runs;
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -810,8 +818,31 @@ fn run_ledger_view(opts: &Opts) -> Result<(), Fail> {
     }
 
     writeln!(out, "cargogc {VERSION} — ledger — {}", path.display()).map_err(write_fail)?;
+    // Never let a shared ledger read as an empty one: if records exist that this tool did not
+    // write, say how many and that they are not shown (measured 2026-10-10: a repo hook wrote
+    // its own summary lines into the same file and the view printed "no runs recorded").
+    if outcome.foreign > 0 {
+        writeln!(
+            out,
+            "  ignored: {} record(s) not written by cargogc (another writer shares this ledger; not shown)",
+            outcome.foreign
+        )
+        .map_err(write_fail)?;
+    }
+    if outcome.unparsable > 0 {
+        writeln!(
+            out,
+            "  skipped: {} unparsable line(s) (a truncated final line is what a killed run leaves)",
+            outcome.unparsable
+        )
+        .map_err(write_fail)?;
+    }
     if runs.is_empty() {
-        writeln!(out, "  no runs recorded").map_err(write_fail)?;
+        if outcome.foreign > 0 {
+            writeln!(out, "  no cargogc runs recorded").map_err(write_fail)?;
+        } else {
+            writeln!(out, "  no runs recorded").map_err(write_fail)?;
+        }
         return Ok(());
     }
     for run in &runs {
