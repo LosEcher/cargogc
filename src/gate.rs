@@ -179,6 +179,13 @@ pub fn probe(_candidates: &[PathBuf]) -> Probe {
 /// Holding the value keeps the lock; dropping it releases the lock (the fd is closed
 /// by `File`'s safe `Drop`). The gate takes and immediately drops one of these, and the
 /// test suite uses the same safe API to play the part of a running build.
+///
+/// One property worth knowing if you ever hold one of these across a `Command::spawn`:
+/// `flock` lives on the open file description, and `fork` duplicates the descriptor. A
+/// child that has been forked but has not yet reached `exec` therefore keeps the lock
+/// alive, so this process closing its own fd does not release it — a same-process
+/// re-acquire can transiently report "held" (measured, only under parallel test load).
+/// The gate itself never holds a lock across a spawn; it probes and releases.
 #[cfg(unix)]
 pub struct LockGuard {
     // Owns the descriptor: closing it is what releases the flock, and it needs no

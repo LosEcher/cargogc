@@ -387,6 +387,98 @@ pub fn system_time_secs(time: SystemTime) -> Option<i64> {
     }
 }
 
+// ── batch discovery (`--scan-root`) ─────────────────────────────────────────
+
+/// SCAN_MAX_DEPTH — how many levels below a `--scan-root` the discovery descends.
+pub const SCAN_MAX_DEPTH: usize = 4;
+
+/// Directory names the scan never descends into: version control and dependency trees,
+/// which contain no cargo target directory but plenty of files.
+const SCAN_SKIP_DIRS: [&str; 3] = [".git", ".jj", "node_modules"];
+
+/// discover_targets — every cargo target directory at or below `root`, up to `max_depth`
+/// levels down (the root itself is level 0).
+///
+/// A directory is a target directory when one of its child directories contains an
+/// `incremental/` or a `deps/` directory: that is exactly what a cargo *profile tree*
+/// looks like — `debug`, `release`, a cross-compilation triple such as
+/// `aarch64-apple-darwin`, or a custom profile such as `profiling`. The named cases are
+/// the common ones, but generalising to "any profile-shaped child" is deliberate: a
+/// repository whose only profile tree is a custom profile would otherwise be skipped
+/// silently, and *missing a repository* is the failure mode this mode exists to prevent.
+///
+/// A recognised target directory is never descended into: its `deps/` and `incremental/`
+/// are cargo's own bookkeeping, not nested repositories. Children that are symlinks are
+/// not followed, so a link pointing at an ancestor cannot make the walk loop.
+pub fn discover_targets(root: &Path, max_depth: usize) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = Vec::new();
+    discover_visit(root, 0, max_depth, &mut found);
+    // Two roots can reach the same target (`--scan-root /a --scan-root /a/b`, or a
+    // symlinked root): deduplicate by identity, not by spelling.
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut unique: Vec<PathBuf> = Vec::new();
+    for path in found {
+        let identity = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if seen.contains(&identity) {
+            continue;
+        }
+        seen.push(identity);
+        unique.push(path);
+    }
+    unique.sort();
+    unique
+}
+
+fn discover_visit(dir: &Path, depth: usize, max_depth: usize, found: &mut Vec<PathBuf>) {
+    if is_target_dir(dir) {
+        found.push(dir.to_path_buf());
+        return;
+    }
+    if depth >= max_depth {
+        return;
+    }
+    for child in read_dir_sorted(dir).unwrap_or_default() {
+        // Only real directories: a symlink is not followed, so the walk terminates even
+        // when something links back up the tree.
+        match fs::symlink_metadata(&child) {
+            Ok(meta) if meta.is_dir() => {}
+            _ => continue,
+        }
+        let name = file_name(&child);
+        if SCAN_SKIP_DIRS.contains(&name.as_str()) {
+            continue;
+        }
+        discover_visit(&child, depth + 1, max_depth, found);
+    }
+}
+
+fn is_target_dir(dir: &Path) -> bool {
+    read_dir_sorted(dir)
+        .unwrap_or_default()
+        .iter()
+        .any(|child| child.is_dir() && is_profile_tree(child))
+}
+
+/// is_profile_tree — does this child directory look like `target/<profile>`?
+///
+/// `debug` and `release` are unambiguous under a target directory, so either cargo marker
+/// is enough. Anything else — a cross-compilation triple such as `aarch64-apple-darwin`,
+/// or a custom profile such as `profiling` — needs **two** cargo-specific markers
+/// (`deps/` plus `incremental/` or `.cargo-lock`). That second requirement is what keeps
+/// an ordinary source directory named `…/incremental` or `…/deps` from being mistaken for
+/// a profile tree, while still catching the custom-profile layouts that a
+/// `debug`/`release`/triple-only rule would silently skip.
+fn is_profile_tree(child: &Path) -> bool {
+    let deps = child.join("deps").is_dir();
+    let incremental = child.join("incremental").is_dir();
+    let lock = child.join(".cargo-lock").is_file();
+    let name = file_name(child);
+    if name == "debug" || name == "release" {
+        return deps || incremental;
+    }
+    deps && (incremental || lock)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,5 +664,89 @@ mod tests {
 
     fn now() -> i64 {
         system_time_secs(SystemTime::now()).unwrap()
+    }
+
+    // ── batch discovery ─────────────────────────────────────────────────────
+
+    /// A cargo target directory at `path`, with a profile tree that makes it recognisable.
+    fn fake_target(path: &Path) -> PathBuf {
+        fs::create_dir_all(path.join("debug/deps")).unwrap();
+        fs::create_dir_all(path.join("debug/incremental")).unwrap();
+        path.to_path_buf()
+    }
+
+    fn mkdirs(path: &Path) -> PathBuf {
+        fs::create_dir_all(path).unwrap();
+        path.to_path_buf()
+    }
+
+    #[test]
+    fn scan_finds_a_target_four_levels_down_and_not_five() {
+        let dir = scratch("scan-depth");
+        let shallow = fake_target(&dir.join("a/b/c/target"));
+        mkdirs(&dir.join("x/y/z/w"));
+        let too_deep = fake_target(&dir.join("x/y/z/w/target"));
+
+        let found = discover_targets(&dir, SCAN_MAX_DEPTH);
+        assert_eq!(found, vec![shallow.clone()], "{found:?}");
+        assert!(!found.contains(&too_deep), "five levels down is out of range");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn scan_does_not_descend_into_a_target_directory() {
+        let dir = scratch("scan-nested");
+        let outer = fake_target(&dir.join("app/target"));
+        // A second target directory *inside* the first one's profile tree: cargo never
+        // nests these, so finding it would mean the walk descended past a boundary and a
+        // real repository could be counted twice.
+        let inner = fake_target(&dir.join("app/target/debug/nested/target"));
+
+        let found = discover_targets(&dir, SCAN_MAX_DEPTH);
+        assert_eq!(found, vec![outer], "only the outer target may be reported: {found:?}");
+        assert!(!found.contains(&inner));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn scan_skips_vcs_and_dependency_trees() {
+        let dir = scratch("scan-skips");
+        fake_target(&dir.join(".git/modules/x/target"));
+        fake_target(&dir.join(".jj/repo/target"));
+        fake_target(&dir.join("node_modules/pkg/target"));
+        let real = fake_target(&dir.join("repo/target"));
+
+        let found = discover_targets(&dir, SCAN_MAX_DEPTH);
+        assert_eq!(found, vec![real], "{found:?}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn scan_recognises_a_custom_profile_tree() {
+        let dir = scratch("scan-custom-profile");
+        // `profiling` is a single-word custom profile: the named cases (`debug`,
+        // `release`, `<triple>`) would all miss this tree, and missing a repository is the
+        // failure this mode exists to prevent.
+        let target = dir.join("repo/target");
+        fs::create_dir_all(target.join("profiling/incremental")).unwrap();
+        fs::create_dir_all(target.join("profiling/deps")).unwrap();
+
+        let found = discover_targets(&dir, SCAN_MAX_DEPTH);
+        assert_eq!(found, vec![target], "{found:?}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn scan_ignores_a_directory_that_is_not_a_target_tree() {
+        let dir = scratch("scan-negative");
+        // Two shapes an over-eager rule would swallow: a source directory named
+        // `incremental` (only one cargo marker) and a vendored `deps` directory (also only
+        // one). Neither is a profile tree, so neither parent is a target directory.
+        mkdirs(&dir.join("docs/incremental"));
+        mkdirs(&dir.join("repo/src/vendor/deps"));
+
+        let found = discover_targets(&dir, SCAN_MAX_DEPTH);
+        assert!(found.is_empty(), "no profile tree ⇒ no target directory: {found:?}");
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

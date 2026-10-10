@@ -19,11 +19,11 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cargogc::account;
+use cargogc::account::{self, Totals};
 use cargogc::gate::{self, Probe};
 use cargogc::judge::{self, Inputs};
 use cargogc::ledger::{self, J};
-use cargogc::report::{self, Report};
+use cargogc::report::{self, Report, ReportItem, ScanReport, TargetReport};
 use cargogc::VERSION;
 
 const EXIT_OK: u8 = 0;
@@ -47,6 +47,10 @@ struct Opts {
     cap: Option<u64>,
     keep_newest_roots: usize,
     dead_dirs: Vec<PathBuf>,
+    /// Batch mode: sweep every cargo target directory found under these roots. Mutually
+    /// exclusive with `--target-dir`, and `--dead-dir` does not compose with it (a dead
+    /// tree is derived from one repository's manifest, which a scan does not have).
+    scan_roots: Vec<PathBuf>,
     ledger: Option<PathBuf>,
     json: bool,
     reconcile: bool,
@@ -119,6 +123,21 @@ OPTIONS:
     --target-dir DIR            the cargo target directory (e.g. ./target).
                                 Default: search the current directory and its parents
                                 for one that contains `target/`.
+    --scan-root DIR             batch mode (repeatable): sweep every cargo target
+                                directory at or below DIR, up to 4 levels down, skipping
+                                .git/.jj/node_modules and never descending into a target
+                                directory. Mutually exclusive with --target-dir.
+                                Differences from single-target mode:
+                                  * a held lock SKIPS that target and the round continues
+                                    (single-target mode refuses the whole run, exit 3);
+                                    every skipped target is named in the report and the
+                                    ledger — never silently dropped;
+                                  * `dead` does not participate (it is derived from a
+                                    repository's manifest, and a scan has none);
+                                  * the build record is one policy for the whole round,
+                                    e.g. --superseded-since \"$(date -v-1d +%s)\" (24h ago);
+                                  * --keep-newest-roots matters more, not less: it keeps
+                                    at least one root per crate name in every repository.
     --superseded-since T        the build record: unix seconds, or ISO-8601 with an
                                 explicit offset (2026-10-10T15:50:00+08:00). Relative
                                 forms (\"2h ago\") and bare local times are refused:
@@ -169,6 +188,7 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
         cap: None,
         keep_newest_roots: 1,
         dead_dirs: Vec::new(),
+        scan_roots: Vec::new(),
         ledger: None,
         json: false,
         reconcile: false,
@@ -207,6 +227,9 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
             "--dead-dir" => opts
                 .dead_dirs
                 .push(PathBuf::from(take_value("--dead-dir", &mut index)?)),
+            "--scan-root" => opts
+                .scan_roots
+                .push(PathBuf::from(take_value("--scan-root", &mut index)?)),
             "--ledger" => opts.ledger = Some(PathBuf::from(take_value("--ledger", &mut index)?)),
             "--json" => opts.json = true,
             "--reconcile" => opts.reconcile = true,
@@ -234,6 +257,7 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
                 (opts.last_build_file.is_some(), "--last-build-file"),
                 (opts.cap.is_some(), "--live-incremental-max"),
                 (!opts.dead_dirs.is_empty(), "--dead-dir"),
+                (!opts.scan_roots.is_empty(), "--scan-root"),
                 (opts.reconcile, "--reconcile"),
             ] {
                 if present {
@@ -251,6 +275,20 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
             }
             if opts.reconcile && opts.ledger.is_none() {
                 return Err("--reconcile reads the ledger; give --ledger PATH".to_string());
+            }
+            if !opts.scan_roots.is_empty() && opts.target_dir.is_some() {
+                return Err(
+                    "--scan-root and --target-dir are two different modes (many targets vs one); \
+                     give one"
+                        .to_string(),
+                );
+            }
+            if !opts.scan_roots.is_empty() && !opts.dead_dirs.is_empty() {
+                return Err(
+                    "--dead-dir names one repository's tree, derived from its manifest; scan mode \
+                     has no manifest, so there is nothing to compose it with"
+                        .to_string(),
+                );
             }
         }
     }
@@ -434,8 +472,339 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 fn run(opts: &Opts) -> Result<(), Fail> {
     match opts.op {
         Op::LedgerView => run_ledger_view(opts),
+        Op::Plan | Op::Apply if !opts.scan_roots.is_empty() => run_scan(opts),
         Op::Plan | Op::Apply => run_sweep(opts),
     }
+}
+
+/// run_scan — one round over every cargo target directory found under the scan roots.
+///
+/// Each target runs the same judge → account → gate pipeline as single-target mode. Two
+/// things differ, and both are stated in `--help`, the README and the report:
+///
+/// * a held lock (or an unusable probe) **skips that target** and the round continues —
+///   a nightly batch over twenty repositories must not be voided by one of them building;
+///   every skipped target is named in the report and in the ledger, never silently dropped;
+/// * `dead` does not participate: it is derived from a repository's manifest, and a scan
+///   has no manifest per target. The report says so explicitly instead of guessing.
+fn run_scan(opts: &Opts) -> Result<(), Fail> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut discovered: Vec<PathBuf> = Vec::new();
+    for root in &opts.scan_roots {
+        if !root.is_dir() {
+            return Err(Fail::Usage(format!(
+                "--scan-root is not a directory: {}",
+                root.display()
+            )));
+        }
+        roots.push(root.clone());
+        discovered.extend(judge::discover_targets(root, judge::SCAN_MAX_DEPTH));
+    }
+    // Overlapping roots (`--scan-root /a --scan-root /a/b`) must not sweep one target twice.
+    let targets = dedupe_paths(discovered);
+
+    let record = resolve_since(opts)?;
+    let mut notes = record.notes.clone();
+    if targets.is_empty() {
+        notes.push(format!(
+            "no cargo target directory found under {} (searched {} level(s) down, skipping \
+             .git/.jj/node_modules and never descending into a target directory)",
+            roots
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            judge::SCAN_MAX_DEPTH
+        ));
+    }
+
+    let apply = opts.op == Op::Apply;
+    let run_id = new_run_id();
+    if apply && !targets.is_empty() {
+        // One run for the whole round. Written before the first deletion so a killed
+        // scan still shows up as `interrupted` in `ledger --view`.
+        if let Some(path) = &opts.ledger {
+            append_ledger(
+                path,
+                &scan_start_record(&run_id, opts, &roots, record.since, targets.len()),
+            )?;
+        }
+    }
+
+    let mut target_reports: Vec<TargetReport> = Vec::new();
+    let mut scan_totals = Totals::default();
+    let mut failures: Vec<String> = Vec::new();
+
+    for target in &targets {
+        let mut input = Inputs::new(target.clone());
+        input.since = record.since;
+        input.cap = opts.cap;
+        input.keep_newest_roots = opts.keep_newest_roots;
+        // No manifest ⇒ no dead class. Deliberately not guessed from other repositories.
+        input.dead_dirs = Vec::new();
+
+        let plan = judge::plan(&input)
+            .map_err(|err| Fail::Runtime(format!("cannot read {}: {err}", target.display())))?;
+        let paths: Vec<PathBuf> = plan.iter().map(|item| item.path.clone()).collect();
+        let (per_item, totals) = account::account(&paths).map_err(|err| {
+            Fail::Runtime(format!(
+                "cannot account for the plan under {}: {err}",
+                target.display()
+            ))
+        })?;
+        let probe = gate::probe(&gate::candidate_locks(target));
+
+        let items: Vec<ReportItem> = plan
+            .iter()
+            .enumerate()
+            .map(|(index, item)| ReportItem {
+                kind: item.kind,
+                path: item.path.clone(),
+                reason: item.reason.clone(),
+                bytes: per_item.get(index).copied().unwrap_or_default(),
+            })
+            .collect();
+        let mut entry = TargetReport {
+            target: target.clone(),
+            items,
+            totals,
+            gate: probe.clone(),
+            skipped: None,
+            failures: Vec::new(),
+        };
+
+        if apply && !probe.is_free() {
+            entry.skipped = Some(probe.describe());
+        } else if apply {
+            for item in entry.items.iter_mut() {
+                if let Err(err) = delete_path(&item.path) {
+                    entry.failures.push(format!("{}: {err}", item.path.display()));
+                    item.reason = format!("{} (FAILED)", item.reason);
+                }
+            }
+        }
+
+        failures.extend(entry.failures.iter().cloned());
+        // A target a build is holding contributes nothing to this round: in apply mode it is
+        // skipped, and in a *preview* it is still shown for information (the reader wants to
+        // know what is waiting there) but must not inflate the round total — otherwise `plan`
+        // promises bytes that `apply` will not return, which is exactly the overstatement the
+        // four numbers exist to prevent. Measured: with one locked repo the preview said
+        // "3 items" where apply deleted 2.
+        let contributes = entry.skipped.is_none() && entry.gate.is_free();
+        if contributes {
+            scan_totals.items += entry.items.len();
+            scan_totals.freed_du += entry.totals.freed_du;
+            scan_totals.logical += entry.totals.logical;
+            scan_totals.shared_du += entry.totals.shared_du;
+            scan_totals.shared_inodes += entry.totals.shared_inodes;
+        }
+        target_reports.push(entry);
+    }
+
+    let skipped_count = target_reports
+        .iter()
+        .filter(|target| target.skipped.is_some())
+        .count();
+    let applied_count = target_reports.len() - skipped_count;
+    let verdict = if !apply {
+        "preview"
+    } else if !target_reports.is_empty() && applied_count == 0 {
+        "skipped"
+    } else if failures.is_empty() {
+        "applied"
+    } else {
+        "partial"
+    };
+
+    let mut report = ScanReport {
+        op: if apply { "apply" } else { "plan" },
+        verdict,
+        roots,
+        targets: target_reports,
+        scan_totals,
+        since: record.since,
+        since_source: record.source,
+        cap: opts.cap,
+        keep_newest_roots: opts.keep_newest_roots,
+        failures,
+        notes,
+        reconcile: Vec::new(),
+    };
+
+    if apply && !report.targets.is_empty() {
+        if let Some(path) = &opts.ledger {
+            append_ledger(path, &scan_finish_record(&run_id, &report))?;
+        }
+    }
+    if opts.reconcile {
+        report.reconcile = reconcile_lines(opts, report.scan_totals)?;
+    }
+
+    render_scan(&report, opts.json)?;
+    if !report.failures.is_empty() {
+        return Err(Fail::Runtime(format!(
+            "{} item(s) could not be deleted across {} target(s)",
+            report.failures.len(),
+            report.targets.len()
+        )));
+    }
+    Ok(())
+}
+
+/// dedupe_paths — one entry per directory, by identity rather than by spelling (two
+/// overlapping roots, or a root reached through a symlink, must not sweep twice).
+fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut unique: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        let identity = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if seen.contains(&identity) {
+            continue;
+        }
+        seen.push(identity);
+        unique.push(path);
+    }
+    unique.sort();
+    unique
+}
+
+/// scan_start_record — one ledger `start` for the whole round: a scan is one run.
+fn scan_start_record(
+    run_id: &str,
+    opts: &Opts,
+    roots: &[PathBuf],
+    since: Option<i64>,
+    target_count: usize,
+) -> J {
+    J::obj(vec![
+        ("evt", J::S("start".into())),
+        ("run_id", J::S(run_id.to_string())),
+        ("ts", J::S(now_iso())),
+        ("op", J::S("apply".into())),
+        ("mode", J::S("scan".into())),
+        (
+            "roots",
+            J::A(
+                roots
+                    .iter()
+                    .map(|root| J::S(root.to_string_lossy().into_owned()))
+                    .collect(),
+            ),
+        ),
+        ("targets_count", J::U(target_count as u64)),
+        ("since", J::I(since.unwrap_or(0))),
+        ("cap_bytes", J::U(opts.cap.unwrap_or(0))),
+        ("keep_newest_roots", J::U(opts.keep_newest_roots as u64)),
+        ("pid", J::U(std::process::id() as u64)),
+        ("tool", J::S("cargogc".into())),
+        ("version", J::S(VERSION.into())),
+    ])
+}
+
+/// scan_finish_record — one ledger `finish` carrying every target of the round.
+///
+/// A skipped target keeps its planned classes in the record (they answer "what did this
+/// round miss?"), which is why the reader must exclude skipped targets from the run
+/// totals — see `ledger::view`.
+fn scan_finish_record(run_id: &str, report: &ScanReport) -> J {
+    let targets = report
+        .targets
+        .iter()
+        .map(|target| {
+            let classes = report::class_totals(&target.items)
+                .into_iter()
+                .map(|(kind, count, bytes)| {
+                    J::obj(vec![
+                        ("kind", J::S(kind.as_str().to_string())),
+                        ("items", J::U(count as u64)),
+                        ("bytes_du", J::U(bytes.freed_du)),
+                        ("bytes_logical", J::U(bytes.logical)),
+                        ("shared_du", J::U(bytes.shared_du)),
+                    ])
+                })
+                .collect();
+            let mut fields = vec![
+                ("target", J::S(target.target.to_string_lossy().into_owned())),
+                (
+                    "verdict",
+                    J::S(
+                        if target.skipped.is_some() {
+                            "skipped"
+                        } else {
+                            "applied"
+                        }
+                        .to_string(),
+                    ),
+                ),
+                ("gate", J::S(target.gate.describe())),
+                ("classes", J::A(classes)),
+                ("items", J::U(target.items.len() as u64)),
+                ("bytes_du", J::U(target.totals.freed_du)),
+                ("bytes_logical", J::U(target.totals.logical)),
+                ("shared_du", J::U(target.totals.shared_du)),
+                ("failed", J::U(target.failures.len() as u64)),
+            ];
+            if let Some(reason) = &target.skipped {
+                fields.push((
+                    "skipped",
+                    J::obj(vec![
+                        (
+                            "reason",
+                            J::S(report::skip_reason_code(&target.gate).to_string()),
+                        ),
+                        ("detail", J::S(reason.clone())),
+                    ]),
+                ));
+            }
+            J::obj(fields)
+        })
+        .collect();
+
+    let skipped: Vec<J> = report
+        .skipped()
+        .iter()
+        .map(|target| J::S(target.target.to_string_lossy().into_owned()))
+        .collect();
+
+    J::obj(vec![
+        ("evt", J::S("finish".into())),
+        ("run_id", J::S(run_id.to_string())),
+        ("ts", J::S(now_iso())),
+        ("verdict", J::S(report.verdict.to_string())),
+        ("mode", J::S("scan".into())),
+        ("since", J::I(report.since.unwrap_or(0))),
+        ("targets", J::A(targets)),
+        ("skipped", J::A(skipped)),
+        ("targets_count", J::U(report.targets.len() as u64)),
+        ("skipped_count", J::U(report.skipped().len() as u64)),
+        ("items", J::U(report.item_count() as u64)),
+        (
+            "removed",
+            J::U(report.item_count().saturating_sub(report.failures.len()) as u64),
+        ),
+        ("failed", J::U(report.failures.len() as u64)),
+        ("bytes_du", J::U(report.scan_totals.freed_du)),
+        ("bytes_logical", J::U(report.scan_totals.logical)),
+        ("shared_du", J::U(report.scan_totals.shared_du)),
+        (
+            "shared_inodes",
+            J::U(report.scan_totals.shared_inodes as u64),
+        ),
+        ("tool", J::S("cargogc".into())),
+        ("version", J::S(VERSION.into())),
+    ])
+}
+
+fn render_scan(report: &ScanReport, json: bool) -> Result<(), Fail> {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let result = if json {
+        report::render_scan_json(report, &mut out)
+    } else {
+        report::render_scan_human(report, &mut out)
+    };
+    result.map_err(write_fail)
 }
 
 fn run_sweep(opts: &Opts) -> Result<(), Fail> {
@@ -568,7 +937,7 @@ fn run_sweep(opts: &Opts) -> Result<(), Fail> {
     }
 
     if opts.reconcile {
-        report.reconcile = reconcile_lines(opts, &report)?;
+        report.reconcile = reconcile_lines(opts, report.totals)?;
     }
 
     render(&report, opts.json)?;
@@ -725,7 +1094,10 @@ fn resolve_since(opts: &Opts) -> Result<BuildRecord, Fail> {
     Ok(record)
 }
 
-fn reconcile_lines(opts: &Opts, report: &Report) -> Result<Vec<String>, Fail> {
+/// reconcile_lines — what the ledger says about the last apply, next to what is reclaimable
+/// right now. Shared by both modes: the "reclaimable" side is whatever the current round
+/// measured, and the ledger side is mode-agnostic.
+fn reconcile_lines(opts: &Opts, reclaimable: Totals) -> Result<Vec<String>, Fail> {
     let Some(path) = &opts.ledger else {
         return Ok(Vec::new());
     };
@@ -767,9 +1139,9 @@ fn reconcile_lines(opts: &Opts, report: &Report) -> Result<Vec<String>, Fail> {
     }
     lines.push(format!(
         "reclaimable now: {} item(s), {} ⇒ {}",
-        report.totals.items,
-        account::human(report.totals.freed_du),
-        if report.totals.items == 0 {
+        reclaimable.items,
+        account::human(reclaimable.freed_du),
+        if reclaimable.items == 0 {
             "converged"
         } else {
             "reclaimable"
@@ -809,6 +1181,9 @@ fn run_ledger_view(opts: &Opts) -> Result<(), Fail> {
                         ("shared_du", J::U(run.shared_du)),
                         ("since", J::I(run.since.unwrap_or(0))),
                         ("interrupted", J::B(run.interrupted)),
+                        ("mode", J::S(run.mode.clone())),
+                        ("targets", J::U(run.targets_count as u64)),
+                        ("skipped_targets", J::U(run.skipped_count as u64)),
                     ])
                 })
                 .collect(),
@@ -846,19 +1221,27 @@ fn run_ledger_view(opts: &Opts) -> Result<(), Fail> {
         return Ok(());
     }
     for run in &runs {
+        // Both shapes share this table: a scan run reports how many targets it covered
+        // (and how many it skipped) where a single-target run names its one target.
+        let scope = if run.mode == "scan" {
+            format!(
+                "{} targets ({} skipped)",
+                run.targets_count, run.skipped_count
+            )
+        } else if run.target.is_empty() {
+            "target -".to_string()
+        } else {
+            format!("target {}", run.target)
+        };
         writeln!(
             out,
-            "  {:<20} {:<7} {:<11} {:>4} items {:>12} freed   target {}",
+            "  {:<20} {:<7} {:<11} {:>4} items {:>12} freed   {}",
             run.started,
             run.op,
             run.verdict,
             run.items,
             account::human(run.freed_du),
-            if run.target.is_empty() {
-                "-"
-            } else {
-                &run.target
-            }
+            scope
         )
         .map_err(write_fail)?;
     }

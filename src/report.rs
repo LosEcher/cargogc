@@ -382,6 +382,405 @@ pub fn render_json(report: &Report, out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "{}", document.render())
 }
 
+// ── batch mode (`--scan-root`) ──────────────────────────────────────────────
+//
+// Scan mode shares every judgement and every number with single-target mode; what it
+// changes is what happens to a *problem* and how the round is summarised. Two rules are
+// specific to it and are stated wherever a reader meets the mode (help, README, report):
+//
+//   * a held lock skips that target and the round continues (single-target mode refuses
+//     the whole run with exit 3) — a nightly batch must not be voided by one repository
+//     that happens to be building, but a skipped target is always named, never silent;
+//   * `dead` does not participate, because the dead class is derived from a repository's
+//     own manifest and a scan has no manifest per target.
+
+/// The sentence scan mode prints in place of the `dead` class. Constants so the help, the
+/// report and the tests cannot drift apart.
+pub const SCAN_DEAD_NOTE: &str = "skipped (scan mode has no manifest)";
+
+/// One target directory inside a scan round.
+#[derive(Debug, Clone)]
+pub struct TargetReport {
+    pub target: PathBuf,
+    pub items: Vec<ReportItem>,
+    pub totals: Totals,
+    pub gate: Probe,
+    /// `Some(reason)` when this target was skipped. The string is the human reason; the
+    /// machine reason is derived from the gate ([`skip_reason_code`]).
+    pub skipped: Option<String>,
+    pub failures: Vec<String>,
+}
+
+/// skip_reason_code — the machine-readable why, for JSON and the ledger.
+pub fn skip_reason_code(gate: &Probe) -> &'static str {
+    match gate {
+        Probe::Held(_) => "lock-held",
+        Probe::Unavailable(_) => "probe-unavailable",
+        Probe::Free => "skipped",
+    }
+}
+
+/// A whole `--scan-root` round.
+#[derive(Debug, Clone)]
+pub struct ScanReport {
+    pub op: &'static str,
+    pub verdict: &'static str,
+    pub roots: Vec<PathBuf>,
+    pub targets: Vec<TargetReport>,
+    pub scan_totals: Totals,
+    pub since: Option<i64>,
+    pub since_source: Option<String>,
+    pub cap: Option<u64>,
+    pub keep_newest_roots: usize,
+    pub failures: Vec<String>,
+    pub notes: Vec<String>,
+    /// Pre-rendered reconciliation lines (P1's `--reconcile`).
+    pub reconcile: Vec<String>,
+}
+
+impl ScanReport {
+    pub fn applied(&self) -> Vec<&TargetReport> {
+        self.targets.iter().filter(|t| t.skipped.is_none()).collect()
+    }
+
+    pub fn skipped(&self) -> Vec<&TargetReport> {
+        self.targets.iter().filter(|t| t.skipped.is_some()).collect()
+    }
+
+    /// How many items the round covers **after** skipping **and gating**: a skipped target
+    /// contributes nothing (none of its plan was carried out), and a target a build is holding
+    /// contributes nothing either — in apply mode it is skipped, and in a preview it is shown
+    /// for information but must not inflate the total, or `plan` would promise bytes that
+    /// `apply` will not return (measured: preview "2 items" where apply deleted 1).
+    ///
+    /// A target's own row still shows what its plan *would* have reclaimed — that is the
+    /// number a reader asks for when the round missed something, so it is kept and marked.
+    pub fn item_count(&self) -> usize {
+        self.applied()
+            .iter()
+            .filter(|t| t.gate.is_free())
+            .map(|t| t.items.len())
+            .sum()
+    }
+}
+
+fn note_line(report: &ScanReport, out: &mut impl Write) -> io::Result<()> {
+    writeln!(
+        out,
+        "  dead: {SCAN_DEAD_NOTE}",
+    )?;
+    match (report.since, &report.since_source) {
+        (Some(since), Some(source)) => writeln!(
+            out,
+            "  since: {since} ({})   [{source}]",
+            format_epoch_utc(since)
+        ),
+        _ => writeln!(
+            out,
+            "  since: (no build record) — the superseded classes do nothing without one"
+        ),
+    }
+}
+
+/// render_scan_human — one line per target, then the round totals and the skipped list.
+///
+/// Per-item lines are deliberately absent: a nightly batch over twenty repositories would
+/// print thousands of them, and the question a reader has at that scale is "which
+/// repository, how much, and which ones were skipped".
+pub fn render_scan_human(report: &ScanReport, out: &mut impl Write) -> io::Result<()> {
+    let deleted = report.verdict == "applied" || report.verdict == "partial";
+    writeln!(
+        out,
+        "cargogc {VERSION} — {} — scan mode: {} target(s) under {} root(s)",
+        report.op,
+        report.targets.len(),
+        report.roots.len()
+    )?;
+    writeln!(
+        out,
+        "  roots: {}",
+        report
+            .roots
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )?;
+    note_line(report, out)?;
+    if let Some(cap) = report.cap {
+        writeln!(
+            out,
+            "  live incremental cap: {}   keep newest roots per crate: {}",
+            account::human(cap),
+            report.keep_newest_roots
+        )?;
+    } else {
+        writeln!(
+            out,
+            "  keep newest roots per crate: {}",
+            report.keep_newest_roots
+        )?;
+    }
+    for note in &report.notes {
+        writeln!(out, "  note: {note}")?;
+    }
+    writeln!(out)?;
+
+    for target in &report.targets {
+        let skipped = target.skipped.is_some();
+        let verb = if skipped {
+            "skip "
+        } else if deleted {
+            "apply"
+        } else {
+            "plan "
+        };
+        // A skipped target's numbers are what its plan *would* have reclaimed, and they are
+        // excluded from the round totals — marked, because "8 KiB freed" next to a skip
+        // reads like 8 KiB came back.
+        // A gated row in a preview is marked like a skip: its numbers are not in the total.
+        let mark = if skipped || (!deleted && !target.gate.is_free()) {
+            "*"
+        } else {
+            " "
+        };
+        writeln!(
+            out,
+            "  {verb}  {:<48} {:>5} items {:>12} freed{mark}  gate {}",
+            target.target.display(),
+            target.items.len(),
+            account::human(target.totals.freed_du),
+            target.gate.describe()
+        )?;
+    }
+
+    writeln!(out)?;
+    // A preview must not say "applied": nothing was applied, and in a preview a held gate is
+    // reported as information rather than as a skip (the plan is still shown for that target).
+    // Saying "4 applied" over a run that deleted nothing is the same class of misstatement the
+    // four-numbers rule exists to prevent.
+    if deleted {
+        writeln!(
+            out,
+            "  target(s): {} ({} applied, {} skipped)",
+            report.targets.len(),
+            report.applied().len(),
+            report.skipped().len()
+        )?;
+    } else {
+        let gated = report
+            .targets
+            .iter()
+            .filter(|target| target.skipped.is_none() && !target.gate.is_free())
+            .count();
+        writeln!(
+            out,
+            "  target(s): {} ({} would be swept, {} held by a build)",
+            report.targets.len(),
+            report.applied().len() - gated,
+            gated
+        )?;
+    }
+    let inflation = account::inflation(report.scan_totals.logical, report.scan_totals.freed_du);
+    let inflation_text = if inflation.is_finite() {
+        format!("{inflation:.2}x")
+    } else {
+        "n/a".to_string()
+    };
+    writeln!(
+        out,
+        "  freed (du, inode-honest)  {:>12}",
+        account::human(report.scan_totals.freed_du)
+    )?;
+    writeln!(
+        out,
+        "  logical (per path)        {:>12}   inflation {inflation_text}",
+        account::human(report.scan_totals.logical)
+    )?;
+    writeln!(
+        out,
+        "  shared, still allocated   {:>12}   ({} inodes hardlinked outside the delete set)",
+        account::human(report.scan_totals.shared_du),
+        report.scan_totals.shared_inodes
+    )?;
+
+    let skipped = report.skipped();
+    if !skipped.is_empty() {
+        writeln!(out)?;
+        writeln!(out, "  skipped targets (nothing was deleted in these):")?;
+        for target in skipped {
+            writeln!(
+                out,
+                "    {}   {}",
+                target.target.display(),
+                target.skipped.clone().unwrap_or_default()
+            )?;
+        }
+        writeln!(
+            out,
+            "  * the numbers on a marked row are what its plan would have reclaimed, and they are \
+             not in the round totals above."
+        )?;
+    }
+    for failure in &report.failures {
+        writeln!(out, "  FAILED: {failure}")?;
+    }
+    if !report.reconcile.is_empty() {
+        writeln!(out)?;
+        for line in &report.reconcile {
+            writeln!(out, "  {line}")?;
+        }
+    }
+
+    writeln!(out)?;
+    match report.verdict {
+        "preview" => {
+            if report.item_count() == 0 {
+                writeln!(out, "  nothing to reclaim.")?;
+            } else {
+                writeln!(
+                    out,
+                    "  dry-run: nothing was deleted. Re-run as `cargogc apply` with the same arguments."
+                )?;
+            }
+        }
+        "applied" => writeln!(
+            out,
+            "  applied: {} item(s) deleted across {} target(s).",
+            report.item_count(),
+            report.applied().len()
+        )?,
+        "partial" => writeln!(
+            out,
+            "  applied with failures: {} item(s) deleted, {} failed (see FAILED above).",
+            report.item_count(),
+            report.failures.len()
+        )?,
+        "skipped" => writeln!(
+            out,
+            "  every target was skipped; nothing was deleted. Re-run once those builds finish."
+        )?,
+        other => writeln!(out, "  verdict: {other}")?,
+    }
+    Ok(())
+}
+
+/// render_scan_json — the round aggregate: `targets[]` plus `scan_totals`.
+pub fn render_scan_json(report: &ScanReport, out: &mut impl Write) -> io::Result<()> {
+    let targets = report
+        .targets
+        .iter()
+        .map(|target| {
+            let classes = class_totals(&target.items)
+                .into_iter()
+                .map(|(kind, count, bytes)| {
+                    J::obj(vec![
+                        ("kind", J::S(kind.as_str().to_string())),
+                        ("items", J::U(count as u64)),
+                        ("bytes_du", J::U(bytes.freed_du)),
+                        ("bytes_logical", J::U(bytes.logical)),
+                        ("shared_du", J::U(bytes.shared_du)),
+                    ])
+                })
+                .collect();
+            let gate = J::obj(vec![
+                ("state", J::S(target.gate.state().into())),
+                ("detail", J::S(target.gate.describe())),
+            ]);
+            let mut fields = vec![
+                ("target", J::S(target.target.to_string_lossy().into_owned())),
+                (
+                    "verdict",
+                    J::S(if target.skipped.is_some() { "skipped" } else { "applied" }.into()),
+                ),
+                ("gate", gate),
+                ("classes", J::A(classes)),
+                (
+                    "totals",
+                    J::obj(vec![
+                        ("items", J::U(target.items.len() as u64)),
+                        ("bytes_du", J::U(target.totals.freed_du)),
+                        ("bytes_logical", J::U(target.totals.logical)),
+                        ("shared_du", J::U(target.totals.shared_du)),
+                        ("shared_inodes", J::U(target.totals.shared_inodes as u64)),
+                    ]),
+                ),
+            ];
+            if let Some(reason) = &target.skipped {
+                fields.push((
+                    "skipped",
+                    J::obj(vec![
+                        ("reason", J::S(skip_reason_code(&target.gate).into())),
+                        ("detail", J::S(reason.clone())),
+                    ]),
+                ));
+            }
+            J::obj(fields)
+        })
+        .collect();
+
+    let skipped_paths: Vec<J> = report
+        .skipped()
+        .iter()
+        .map(|t| J::S(t.target.to_string_lossy().into_owned()))
+        .collect();
+
+    let inflation = account::inflation(report.scan_totals.logical, report.scan_totals.freed_du);
+    let document = J::obj(vec![
+        ("tool", J::S("cargogc".into())),
+        ("version", J::S(VERSION.into())),
+        ("op", J::S(report.op.into())),
+        ("mode", J::S("scan".into())),
+        ("verdict", J::S(report.verdict.into())),
+        (
+            "roots",
+            J::A(
+                report
+                    .roots
+                    .iter()
+                    .map(|r| J::S(r.to_string_lossy().into_owned()))
+                    .collect(),
+            ),
+        ),
+        (
+            "since",
+            J::I(report.since.unwrap_or(0)),
+        ),
+        (
+            "since_source",
+            J::S(report.since_source.clone().unwrap_or_default()),
+        ),
+        ("cap_bytes", J::U(report.cap.unwrap_or(0))),
+        ("keep_newest_roots", J::U(report.keep_newest_roots as u64)),
+        ("dead", J::S(SCAN_DEAD_NOTE.into())),
+        ("targets", J::A(targets)),
+        ("skipped", J::A(skipped_paths)),
+        (
+            "scan_totals",
+            J::obj(vec![
+                ("targets", J::U(report.targets.len() as u64)),
+                ("applied", J::U(report.applied().len() as u64)),
+                ("skipped", J::U(report.skipped().len() as u64)),
+                ("items", J::U(report.item_count() as u64)),
+                ("bytes_du", J::U(report.scan_totals.freed_du)),
+                ("bytes_logical", J::U(report.scan_totals.logical)),
+                ("shared_du", J::U(report.scan_totals.shared_du)),
+                ("shared_inodes", J::U(report.scan_totals.shared_inodes as u64)),
+                ("inflation", J::F(inflation)),
+            ]),
+        ),
+        (
+            "failures",
+            J::A(report.failures.iter().map(|f| J::S(f.clone())).collect()),
+        ),
+        (
+            "notes",
+            J::A(report.notes.iter().map(|n| J::S(n.clone())).collect()),
+        ),
+    ]);
+    writeln!(out, "{}", document.render())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -107,6 +107,14 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<String>) {
     }
 }
 
+/// A whole subtree's paths and sizes — the "not one byte changed" instrument.
+fn snapshot_of(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    collect(root, root, &mut out);
+    out.sort();
+    out
+}
+
 fn run_in(cwd: Option<&Path>, args: &[&str]) -> (i32, String, String) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_cargogc"));
     command.args(args);
@@ -813,4 +821,539 @@ fn a_nonexistent_target_dir_is_a_runtime_error() {
     let (code, _stdout, stderr) = run(&["plan", "--target-dir", &missing.to_string_lossy()]);
     assert_eq!(code, 1, "stderr: {stderr}");
     assert!(stderr.contains("not a directory"), "{stderr}");
+}
+
+// ── batch mode: --scan-root ─────────────────────────────────────────────────
+//
+// A scan round is judged exactly like a single target (same judge, same accounting, same
+// gate); what these tests pin down is the *round*: which directories are found, what
+// happens to one that cannot be swept, and how the aggregate is reported. The negative
+// control — a locked repository must come out byte-for-byte unchanged while the rest of
+// the round proceeds — is the reason the mode exists.
+
+/// Several throwaway repositories under one scan root.
+struct ScanFixture {
+    root: PathBuf,
+}
+
+impl ScanFixture {
+    fn new(name: &str) -> ScanFixture {
+        let unique = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let root = std::env::temp_dir().join(format!(
+            "cargogc-scan-{}-{name}-{unique}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        ScanFixture { root }
+    }
+
+    /// A repository with a recognisable target tree; returns its target directory.
+    fn repo(&self, repo: &str) -> PathBuf {
+        let target = self.root.join(repo).join("target");
+        fs::create_dir_all(target.join("debug/deps")).unwrap();
+        target
+    }
+
+    /// A crate root inside a repository's debug tree.
+    fn crate_root(&self, target: &Path, name: &str) -> PathBuf {
+        let root = target.join("debug/incremental").join(name);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// A session whose mtime is `age_secs` old. 8192 B of content so the accounting
+    /// assertions can be about a file this test owns, not about a filesystem's directory
+    /// blocks (4096 on ext4, 0 on APFS).
+    fn session(&self, root: &Path, name: &str, age_secs: u64) -> PathBuf {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("dep-graph.bin"), vec![5u8; 8192]).unwrap();
+        let when = SystemTime::now() - Duration::from_secs(age_secs);
+        fs::File::open(&dir).unwrap().set_modified(when).unwrap();
+        dir
+    }
+
+    fn lock(&self, path: &Path) -> PathBuf {
+        fs::write(path, b"").unwrap();
+        path.to_path_buf()
+    }
+
+    fn scan_arg(&self) -> String {
+        self.root.to_string_lossy().into_owned()
+    }
+
+    fn snapshot(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        collect(&self.root, &self.root, &mut out);
+        out.sort();
+        out
+    }
+}
+
+impl Drop for ScanFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+/// The round: A has something stale, B is building, C is clean.
+fn three_repositories(name: &str) -> (ScanFixture, PathBuf, PathBuf, PathBuf) {
+    let fixture = ScanFixture::new(name);
+    let a = fixture.repo("repo-a");
+    let b = fixture.repo("repo-b");
+    let c = fixture.repo("repo-c");
+
+    // A: its newest root is compacted, so the older session goes.
+    let a_root = fixture.crate_root(&a, "liba-aaa");
+    fixture.session(&a_root, "s-old1-aa-1", 8000);
+    fixture.session(&a_root, "s-old2-bb-2", 6000);
+
+    // B: the same shape, but a build holds the repository's lock.
+    let b_root = fixture.crate_root(&b, "libb-aaa");
+    fixture.session(&b_root, "s-old1-cc-1", 8000);
+    fixture.session(&b_root, "s-old2-dd-2", 6000);
+    fixture.lock(&b.join("debug/.cargo-lock"));
+
+    // C: everything participated in the last build.
+    let c_root = fixture.crate_root(&c, "libc-aaa");
+    fixture.session(&c_root, "s-new1-ee-1", 0);
+
+    (fixture, a, b, c)
+}
+
+#[test]
+fn scan_rounds_over_repositories_and_skips_the_locked_one() {
+    let (fixture, _a, b, _c) = three_repositories("rounds");
+    let before_b = fs::read_dir(b.join("debug/incremental/libb-aaa"))
+        .unwrap()
+        .count();
+    // Only B's subtree: A is *supposed* to change in this round, B is not.
+    let snapshot_b = snapshot_of(&b);
+    // One acquisition for the whole test. Re-acquiring after spawning a child is racy and
+    // not because of this tool: `flock` lives on the open file description, and a fork
+    // duplicates the descriptor — a child that has been forked but not yet exec'd keeps
+    // the lock alive even after this process closes its own fd (measured: the second
+    // `try_acquire` intermittently returned "held" while tests ran in parallel). The
+    // gate never holds a lock across a spawn; only this fixture does.
+    let guard = LockGuard::try_acquire(&b.join("debug/.cargo-lock"))
+        .unwrap()
+        .expect("the fixture lock is free");
+
+    let since = now().to_string();
+    let (code, stdout, stderr) = run(&[
+        "apply",
+        "--scan-root",
+        &fixture.scan_arg(),
+        "--superseded-since",
+        &since,
+        "--json",
+    ]);
+
+    assert_eq!(code, 0, "a batch round is not voided by one locked repo: {stderr}");
+    let report = json_of(&stdout);
+    assert_eq!(report.get("mode").unwrap().as_str(), Some("scan"));
+    let totals = report.get("scan_totals").unwrap();
+    assert_eq!(totals.get("targets").unwrap().as_u64(), Some(3));
+    assert_eq!(totals.get("applied").unwrap().as_u64(), Some(2));
+    assert_eq!(totals.get("skipped").unwrap().as_u64(), Some(1));
+    assert_eq!(totals.get("items").unwrap().as_u64(), Some(1), "only A had anything stale");
+    assert!(
+        totals.get("bytes_du").unwrap().as_u64().unwrap() >= 8192,
+        "A's own session file must be in the total: {stdout}"
+    );
+    let skipped = report.get("skipped").unwrap().as_array().unwrap();
+    assert_eq!(skipped.len(), 1);
+    assert!(skipped[0].as_str().unwrap().contains("repo-b"), "{stdout}");
+
+    assert_eq!(
+        snapshot_b,
+        snapshot_of(&b),
+        "the locked repository must not lose one byte"
+    );
+    assert_eq!(
+        fs::read_dir(b.join("debug/incremental/libb-aaa")).unwrap().count(),
+        before_b
+    );
+
+    // The human report names the skipped target too — never silently. The same guard is
+    // still held: this run is about the report, not a second sweep.
+    let (code, stdout, _stderr) = run(&[
+        "apply",
+        "--scan-root",
+        &fixture.scan_arg(),
+        "--superseded-since",
+        &since,
+    ]);
+    drop(guard);
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("skipped targets (nothing was deleted in these):"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("not in the round totals above"),
+        "a skipped row's numbers must be marked as planned, not freed:\n{stdout}"
+    );
+    assert!(stdout.contains("*  gate"), "the marker belongs on the skipped row:\n{stdout}");
+    assert!(stdout.contains("repo-b"), "{stdout}");
+}
+
+#[test]
+fn scan_plan_is_read_only_and_says_dead_is_skipped() {
+    let (fixture, a, _b, _c) = three_repositories("plan");
+    let snapshot = fixture.snapshot();
+    let a_root = a.join("debug/incremental/liba-aaa");
+
+    let (code, stdout, stderr) = run(&[
+        "plan",
+        "--scan-root",
+        &fixture.scan_arg(),
+        "--superseded-since",
+        &now().to_string(),
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("dead: skipped (scan mode has no manifest)"),
+        "scan mode must say the dead class does not participate:\n{stdout}"
+    );
+    assert!(stdout.contains("dry-run: nothing was deleted"), "{stdout}");
+    // A preview must not report "N applied": nothing was applied, and a held gate in a preview
+    // is information (the plan for that target is still shown), not a skip.
+    assert!(
+        stdout.contains("would be swept"),
+        "preview summary must not claim anything was applied:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("target(s)") || !stdout.contains(" applied,"),
+        "preview summary must not say 'applied':\n{stdout}"
+    );
+    assert!(a_root.join("s-old1-aa-1").is_dir(), "plan must not delete");
+    assert_eq!(snapshot, fixture.snapshot(), "plan is read-only");
+}
+
+/// A preview and an apply must agree on the round total while the same target is gated.
+///
+/// Regression: the preview counted the locked target's plan into `scan_totals`, so with one
+/// locked repo it promised "3 items" where apply deleted 2 — the overstatement the four
+/// numbers exist to prevent. A gated target is information in a preview (its row is shown and
+/// marked) but it contributes nothing to the total.
+#[test]
+fn scan_preview_and_apply_agree_on_the_total_when_a_target_is_gated() {
+    let (fixture, _a, b, _c) = three_repositories("gated-total");
+    let guard = LockGuard::try_acquire(&b.join("debug/.cargo-lock"))
+        .unwrap()
+        .expect("the fixture lock is free");
+    let since = now().to_string();
+
+    let (code, stdout, stderr) = run(&[
+        "plan",
+        "--scan-root",
+        &fixture.scan_arg(),
+        "--superseded-since",
+        &since,
+        "--json",
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let preview = json_of(&stdout);
+    let preview_totals = preview.get("scan_totals").unwrap();
+    assert_eq!(
+        preview_totals.get("items").unwrap().as_u64(),
+        Some(1),
+        "a gated target must not contribute to the preview total: {stdout}"
+    );
+    assert_eq!(
+        preview_totals.get("skipped").unwrap().as_u64(),
+        Some(0),
+        "a preview skips nothing; the gate is information"
+    );
+    let gated = preview
+        .get("targets")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t.get("gate").unwrap().get("state").unwrap().as_str() != Some("free"))
+        .count();
+    assert_eq!(gated, 1, "the held target must still be visible: {stdout}");
+
+    // The lock stays held across the apply run too: the invariant is "while the same target is
+    // gated, preview and apply agree on what comes back". Releasing it first would legitimately
+    // let apply reclaim that target as well, which is a different statement.
+    let (code, stdout, stderr) = run(&[
+        "apply",
+        "--scan-root",
+        &fixture.scan_arg(),
+        "--superseded-since",
+        &since,
+        "--json",
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let applied = json_of(&stdout);
+    let applied_totals = applied.get("scan_totals").unwrap();
+    assert_eq!(
+        applied_totals.get("items").unwrap().as_u64(),
+        Some(1),
+        "apply must delete what the preview promised: {stdout}"
+    );
+    assert_eq!(
+        applied_totals.get("skipped").unwrap().as_u64(),
+        Some(1),
+        "the held target is skipped by apply: {stdout}"
+    );
+    drop(guard);
+}
+
+#[test]
+fn scan_finds_a_target_four_levels_down_and_not_a_nested_one() {
+    let fixture = ScanFixture::new("depth");
+    let deep = fixture.root.join("a/b/c/target");
+    fs::create_dir_all(deep.join("debug/deps")).unwrap();
+    let deep_root = fixture.crate_root(&deep, "libdeep-aaa");
+    fixture.session(&deep_root, "s-old1-aa-1", 8000);
+    fixture.session(&deep_root, "s-old2-bb-2", 6000);
+    // A second target tree *inside* the first one's profile directory: the walk must stop
+    // at a recognised target, or this repository would be counted twice.
+    let nested = deep.join("debug/nested/target");
+    fs::create_dir_all(nested.join("debug/deps")).unwrap();
+    let nested_root = fixture.crate_root(&nested, "libnested-aaa");
+    fixture.session(&nested_root, "s-old1-cc-1", 8000);
+    fixture.session(&nested_root, "s-old2-dd-2", 6000);
+
+    let (code, stdout, stderr) = run(&[
+        "plan",
+        "--scan-root",
+        &fixture.scan_arg(),
+        "--superseded-since",
+        &now().to_string(),
+        "--json",
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let report = json_of(&stdout);
+    let targets = report.get("targets").unwrap().as_array().unwrap();
+    assert_eq!(targets.len(), 1, "exactly one target: {stdout}");
+    assert!(targets[0]
+        .get("target")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .ends_with("a/b/c/target"));
+    assert!(!stdout.contains("nested"), "the nested target must not be reported");
+}
+
+#[test]
+fn scan_keeps_the_newest_root_per_crate_in_every_repository() {
+    let fixture = ScanFixture::new("newest-root");
+    let repo = fixture.repo("repo");
+    let old = fixture.crate_root(&repo, "libsame-aaa");
+    let new = fixture.crate_root(&repo, "libsame-bbb");
+    fixture.session(&old, "s-old1-aa-1", 8000);
+    fixture.session(&new, "s-new1-bb-1", 0);
+
+    let (code, _stdout, stderr) = run(&[
+        "apply",
+        "--scan-root",
+        &fixture.scan_arg(),
+        "--superseded-since",
+        &now().to_string(),
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(!old.exists(), "the superseded root goes");
+    assert!(new.join("s-new1-bb-1").is_dir(), "the newest root stays");
+}
+
+#[test]
+fn scan_deduplicates_overlapping_roots() {
+    let fixture = ScanFixture::new("overlap");
+    let repo = fixture.repo("repo");
+    let root = fixture.crate_root(&repo, "libx-aaa");
+    fixture.session(&root, "s-old1-aa-1", 8000);
+    fixture.session(&root, "s-old2-bb-2", 6000);
+
+    let (code, stdout, stderr) = run(&[
+        "plan",
+        "--scan-root",
+        &fixture.scan_arg(),
+        "--scan-root",
+        &fixture.root.join("repo").to_string_lossy(),
+        "--superseded-since",
+        &now().to_string(),
+        "--json",
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let report = json_of(&stdout);
+    assert_eq!(
+        report
+            .get("scan_totals")
+            .unwrap()
+            .get("targets")
+            .unwrap()
+            .as_u64(),
+        Some(1),
+        "an overlapping root must not sweep the same target twice: {stdout}"
+    );
+}
+
+#[test]
+fn scan_rejects_conflicting_modes_and_missing_roots() {
+    let fixture = ScanFixture::new("usage");
+    let target = fixture.repo("repo");
+    let scan = fixture.scan_arg();
+
+    // Both modes at once.
+    let (code, _stdout, stderr) = run(&[
+        "plan",
+        "--scan-root",
+        &scan,
+        "--target-dir",
+        &target.to_string_lossy(),
+    ]);
+    assert_eq!(code, 2, "stderr: {stderr}");
+    assert!(stderr.contains("two different modes"), "{stderr}");
+
+    // `--dead-dir` is one repository's knowledge; a scan has no manifest to derive it from.
+    let (code, _stdout, stderr) = run(&[
+        "plan",
+        "--scan-root",
+        &scan,
+        "--dead-dir",
+        &target.join("release/incremental").to_string_lossy(),
+    ]);
+    assert_eq!(code, 2, "stderr: {stderr}");
+    assert!(stderr.contains("--dead-dir"), "{stderr}");
+
+    // A scan root that does not exist is a usage error, not an empty round.
+    let (code, _stdout, stderr) = run(&[
+        "plan",
+        "--scan-root",
+        &fixture.root.join("nope").to_string_lossy(),
+    ]);
+    assert_eq!(code, 2, "stderr: {stderr}");
+    assert!(stderr.contains("--scan-root is not a directory"), "{stderr}");
+}
+
+#[test]
+fn scan_with_nothing_to_find_is_an_empty_round_not_an_error() {
+    let fixture = ScanFixture::new("empty");
+    fs::create_dir_all(fixture.root.join("docs")).unwrap();
+    let (code, stdout, stderr) = run(&["plan", "--scan-root", &fixture.scan_arg()]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("no cargo target directory found"), "{stdout}");
+    assert!(stdout.contains("nothing to reclaim"), "{stdout}");
+}
+
+/// The probe cannot answer (here: the lock file is unreadable) ⇒ the target is skipped and
+/// named. Treating "I could not check" as "free" is the one thing the gate must never do,
+/// and scan mode keeps that rule per target.
+#[cfg(unix)]
+#[test]
+fn scan_skips_a_target_whose_gate_cannot_be_probed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = ScanFixture::new("unprobeable");
+    let repo = fixture.repo("repo");
+    let root = fixture.crate_root(&repo, "libu-aaa");
+    fixture.session(&root, "s-old1-aa-1", 8000);
+    fixture.session(&root, "s-old2-bb-2", 6000);
+    let lock = fixture.lock(&repo.join("debug/.cargo-lock"));
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o000)).unwrap();
+
+    // Self-check: if this process ignores file modes (a root shell), the gate legitimately
+    // reports "free" and this test has nothing to assert.
+    let probe = cargogc::gate::probe(std::slice::from_ref(&lock));
+    if probe.is_free() {
+        eprintln!(
+            "note: file modes are not enforced for this user, so the unprobeable-lock path \
+             cannot be exercised here; the gate unit test covers it directly"
+        );
+        return;
+    }
+
+    let snapshot = fixture.snapshot();
+    let (code, stdout, stderr) = run(&[
+        "apply",
+        "--scan-root",
+        &fixture.scan_arg(),
+        "--superseded-since",
+        &now().to_string(),
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("unavailable") || stdout.contains("cannot"),
+        "the reason must be named:\n{stdout}"
+    );
+    assert_eq!(snapshot, fixture.snapshot(), "an unprobeable target must not be touched");
+    assert!(root.join("s-old1-aa-1").is_dir());
+}
+
+#[test]
+fn scan_json_names_every_target_and_writes_one_ledger_run() {
+    let (fixture, a, b, _c) = three_repositories("ledger");
+    let ledger_path = fixture.root.join("runs.jsonl");
+    let ledger_arg = ledger_path.to_string_lossy().into_owned();
+
+    // Hold the repository lock for the round, so B is skipped and the scan run has to
+    // carry both an applied and a skipped target.
+    let _ = &b;
+    let guard = LockGuard::try_acquire(&b.join("debug/.cargo-lock"))
+        .unwrap()
+        .expect("the fixture lock is free");
+
+    // A single-target run first, so the view has to show both shapes at once.
+    let (code, _stdout, stderr) = run(&[
+        "apply",
+        "--target-dir",
+        &a.to_string_lossy(),
+        "--superseded-since",
+        &now().to_string(),
+        "--ledger",
+        &ledger_arg,
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+
+    let (code, stdout, stderr) = run(&[
+        "apply",
+        "--scan-root",
+        &fixture.scan_arg(),
+        "--superseded-since",
+        &now().to_string(),
+        "--ledger",
+        &ledger_arg,
+        "--json",
+    ]);
+    drop(guard);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let report = json_of(&stdout);
+    let targets = report.get("targets").unwrap().as_array().unwrap();
+    assert_eq!(targets.len(), 3, "every discovered target is named: {stdout}");
+    assert!(targets
+        .iter()
+        .any(|target| target.get("skipped").is_some()));
+    assert!(targets
+        .iter()
+        .all(|target| target.get("classes").is_some()));
+    assert_eq!(
+        report.get("dead").unwrap().as_str(),
+        Some("skipped (scan mode has no manifest)")
+    );
+
+    // One scan run, and the single-target run beside it.
+    let runs = ledger::view(&ledger_path).unwrap();
+    assert_eq!(runs.runs.len(), 2, "one run per round, not one per target");
+    let single = runs.runs.iter().find(|run| run.mode == "single").unwrap();
+    assert_eq!(single.items, 1);
+    let scan = runs.runs.iter().find(|run| run.mode == "scan").unwrap();
+    assert_eq!(scan.targets_count, 3);
+    assert_eq!(scan.skipped_count, 1);
+    assert_eq!(scan.verdict, "applied");
+
+    // A shared ledger keeps its discipline: other writers' records are counted, not shown.
+    let mut extra = fs::read_to_string(&ledger_path).unwrap();
+    extra.push_str("{\"op\":\"sweep\",\"verdict\":\"ok\"}\n");
+    fs::write(&ledger_path, extra).unwrap();
+    let (code, stdout, stderr) = run(&["ledger", "--view", "--ledger", &ledger_arg]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("1 record(s) not written by cargogc"), "{stdout}");
+    assert!(stdout.contains("3 targets (1 skipped)"), "a scan row shows its breadth:\n{stdout}");
+    assert!(stdout.contains("target "), "a single row still names its target:\n{stdout}");
 }

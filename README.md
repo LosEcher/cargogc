@@ -113,6 +113,7 @@ the tree itself.
 | option | meaning |
 |---|---|
 | `--target-dir DIR` | the cargo target directory; default: search upwards for `target/` |
+| `--scan-root DIR` | batch mode (repeatable): sweep every cargo target directory at or below `DIR`. Mutually exclusive with `--target-dir`; `--dead-dir` does not compose with it (see below) |
 | `--superseded-since T` | the build record: unix seconds, or ISO-8601 **with an offset** |
 | `--last-build-file PATH` | read the build record from a file (unix seconds). Missing or empty ⇒ no record ⇒ the superseded classes do nothing |
 | `--live-incremental-max SIZE` | opt-in cap; `KiB/MiB/GiB` are 1024-based, `KB/MB/GB` are 1000-based, and a bare number is refused |
@@ -136,6 +137,104 @@ Relative timestamps such as `2h ago` are refused, and so are local ISO-8601 time
 an offset. Both mean something different every time they are read, while the whole
 judgement rests on "which builds happened after `T`". Add an offset, or pass the unix
 seconds that a build hook already has.
+
+## Batch mode: `--scan-root`
+
+```console
+# One command, every repository under a tree. The nightly shape:
+$ cargogc apply --scan-root ~/src --superseded-since "$(date -v-1d +%s)" \
+      --ledger ~/.local/cargogc-runs.jsonl
+```
+
+Running per repository is how repositories get missed — the ones nobody remembers are
+exactly the ones nothing sweeps. `--scan-root` (repeatable) walks each root and sweeps
+every cargo target directory it finds.
+
+**Discovery.** Up to **4 levels** below each root; `.git`, `.jj` and `node_modules` are
+never descended into, and neither is a directory once it is recognised as a target
+directory (its `deps/` and `incremental/` are cargo's bookkeeping, not nested
+repositories). A directory is a target directory when one of its children is a *profile
+tree*:
+
+* `debug` or `release`, with a `deps/` or an `incremental/` inside — the common case;
+* any other name (`aarch64-apple-darwin`, or a custom profile such as `profiling`) with
+  `deps/` **and** either `incremental/` or `.cargo-lock`.
+
+Requiring two cargo-specific markers for the unnamed case is what keeps an ordinary
+source directory named `…/incremental` or `…/deps` from being mistaken for a profile tree,
+while still catching custom-profile layouts that a `debug`/`release`/triple-only rule would
+skip silently — and a silently skipped repository is the failure this mode exists to
+prevent.
+
+**Four differences from single-target mode.** They are also in `--help`, and the report
+shows them, because a batch round that behaves differently without saying so is a trap:
+
+1. **A held lock skips that target and the round continues.** Single-target mode refuses
+   the whole run with exit 3; a nightly batch over twenty repositories must not be voided
+   by one of them happening to build. The skipped target is named in the report *and* in
+   the ledger — never silently dropped — and the round still exits **0**.
+2. **`dead` does not participate.** That class comes from a repository's own manifest, and
+   a scan has no manifest per target, so the tool says `dead: skipped (scan mode has no
+   manifest)` instead of guessing. For the same reason `--dead-dir` is refused together
+   with `--scan-root` (exit 2).
+3. **One build record for the whole round.** `--superseded-since` / `--last-build-file`
+   are a policy you set once, and the natural nightly policy is "nothing has touched it for
+   24 hours": `--superseded-since "$(date -v-1d +%s)"`. Relative forms are still refused —
+   the timestamp is resolved once, before the round, not once per target.
+4. **`--keep-newest-roots` matters more, not less.** With one policy across many
+   repositories it is the guarantee that every crate name in every repository keeps at
+   least one root. The default is already `1`.
+
+`plan` never skips: it deletes nothing, so a lock is reported per target (`gate: a build
+holds …`) and the round still shows what is waiting there. But a **gated target contributes
+nothing to the round total** — in a preview as well as in an apply — so `plan` and `apply`
+agree on what comes back while the same target is held (its row is marked `*`, like a skipped
+one). Doing it the other way round is how a preview promised "3 items" where apply deleted 2.
+
+**Output.** The human report is one line per target — path, items, freed `du`, gate — then
+the round totals and the list of skipped targets, with per-item lines left out on purpose
+(a batch over twenty repositories would print thousands):
+
+```console
+$ cargogc apply --scan-root ~/src --superseded-since 1791618600
+cargogc 0.1.3 — apply — scan mode: 3 target(s) under 1 root(s)
+  roots: /home/me/src
+  dead: skipped (scan mode has no manifest)
+  since: 1791618600 (2026-10-10 07:50:00)   [--superseded-since]
+  keep newest roots per crate: 1
+
+  apply  /home/me/src/api/target        12 items      1.09 GiB freed   gate free
+  skip   /home/me/src/web/target         4 items    180.0 KiB freed   gate a build holds /home/me/src/web/target/debug/.cargo-lock
+  apply  /home/me/src/tools/target       0 items           0 B freed   gate free
+
+  target(s): 3 (2 applied, 1 skipped)
+  freed (du, inode-honest)       1.09 GiB
+  ...
+  skipped targets (nothing was deleted in these):
+    /home/me/src/web/target   a build holds /home/me/src/web/target/debug/.cargo-lock
+```
+
+The numbers on a skipped row are what that target's plan *would* have reclaimed — useful
+when you want to know what the round missed — and they are excluded from the round totals.
+
+`--json` returns `targets[]` (each with `target`, `verdict`, `gate`, `classes`, `totals`,
+and a `skipped` object when it was skipped) plus `scan_totals` for the round, and a
+top-level `dead` saying the class did not participate.
+
+**Ledger.** Scan mode appends **one run** for the round, whose `finish` record carries
+`targets[]` — the single-target schema is untouched. `ledger --view` prints both shapes in
+one table (a scan row shows `N targets (M skipped)`):
+
+```console
+$ cargogc ledger --view --ledger ~/.local/cargogc-runs.jsonl
+cargogc 0.1.3 — ledger — /home/me/.local/cargogc-runs.jsonl
+  2026-10-10T07:35:10Z apply   applied        1 items     40.0 KiB freed   target /home/me/src/api/target
+  2026-10-10T07:50:02Z apply   applied      106 items      8.55 GiB freed   3 targets (1 skipped)
+```
+
+A scan run's totals count only the targets it actually swept; the skipped ones are listed
+in the record, so "the round freed 8.55 GiB" can never quietly include bytes that are
+still on disk.
 
 ## Platform boundary: `flock`
 
@@ -175,7 +274,8 @@ $ cargo test
 The suite is fixture-based and runs the real binary. The negative controls matter most: a
 held lock (session lock, and separately cargo's lock) must produce exit 3 **and leave a
 byte-for-byte identical tree**, which the tests check by snapshotting the whole fixture
-and comparing. The accounting tests build a hardlink that leaves the delete set and assert
+and comparing. Batch mode repeats that control per repository: a locked repository must be
+skipped, named, and come out byte-for-byte unchanged while the rest of the round proceeds. The accounting tests build a hardlink that leaves the delete set and assert
 that its bytes are reported as *still allocated* rather than freed.
 
 ## License

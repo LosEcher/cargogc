@@ -381,6 +381,22 @@ pub struct RunView {
     pub since: Option<i64>,
     /// A `start` with no matching `finish`: the process died mid-sweep.
     pub interrupted: bool,
+    /// `"single"` (one target per run) or `"scan"` (one run over many targets). Both
+    /// shapes share this view so `ledger --view` can print a mixed ledger in one table.
+    pub mode: String,
+    /// Scan runs only: how many target directories the round covered, and how many of
+    /// them were skipped (a held lock, an unusable probe).
+    pub targets_count: usize,
+    pub skipped_count: usize,
+}
+
+/// mode_of — `"scan"` when the record says so, `"single"` otherwise (the original shape,
+/// which stays byte-for-byte what it was).
+fn mode_of(value: &P) -> String {
+    match value.get("mode").and_then(P::as_str) {
+        Some("scan") => "scan".to_string(),
+        _ => "single".to_string(),
+    }
 }
 
 /// What a view found, including what it could not use.
@@ -463,6 +479,9 @@ pub fn view(path: &Path) -> io::Result<ViewOutcome> {
                     shared_du: 0,
                     since: value.get("since").and_then(P::as_i64),
                     interrupted: true,
+                    mode: mode_of(&value),
+                    targets_count: 0,
+                    skipped_count: 0,
                 };
                 if !rows.contains_key(&run_id) {
                     order.push(run_id.clone());
@@ -484,16 +503,46 @@ pub fn view(path: &Path) -> io::Result<ViewOutcome> {
                         .unwrap_or("ok")
                         .to_string();
                     row.interrupted = false;
+                    row.mode = mode_of(&value);
                     let mut items = 0u64;
                     let mut freed = 0u64;
                     let mut logical = 0u64;
                     let mut shared = 0u64;
-                    if let Some(classes) = value.get("classes").and_then(P::as_array) {
-                        for class in classes {
-                            items += class.get("items").and_then(P::as_u64).unwrap_or(0);
-                            freed += class.get("bytes_du").and_then(P::as_u64).unwrap_or(0);
-                            logical += class.get("bytes_logical").and_then(P::as_u64).unwrap_or(0);
-                            shared += class.get("shared_du").and_then(P::as_u64).unwrap_or(0);
+                    match value.get("targets").and_then(P::as_array) {
+                        // Scan shape: one run, one entry per target directory. Each entry
+                        // carries its own classes (or none, when it was skipped).
+                        Some(targets) => {
+                            row.targets_count = targets.len();
+                            for target in targets {
+                                let skipped = target.get("skipped").is_some()
+                                    || target.get("verdict").and_then(P::as_str).unwrap_or("")
+                                        == "skipped";
+                                if skipped {
+                                    row.skipped_count += 1;
+                                }
+                                if let Some(classes) = target.get("classes").and_then(P::as_array) {
+                                    for class in classes {
+                                        items += class.get("items").and_then(P::as_u64).unwrap_or(0);
+                                        freed += class.get("bytes_du").and_then(P::as_u64).unwrap_or(0);
+                                        logical += class
+                                            .get("bytes_logical")
+                                            .and_then(P::as_u64)
+                                            .unwrap_or(0);
+                                        shared += class.get("shared_du").and_then(P::as_u64).unwrap_or(0);
+                                    }
+                                }
+                            }
+                        }
+                        // Single-target shape: the classes hang off the finish record.
+                        None => {
+                            if let Some(classes) = value.get("classes").and_then(P::as_array) {
+                                for class in classes {
+                                    items += class.get("items").and_then(P::as_u64).unwrap_or(0);
+                                    freed += class.get("bytes_du").and_then(P::as_u64).unwrap_or(0);
+                                    logical += class.get("bytes_logical").and_then(P::as_u64).unwrap_or(0);
+                                    shared += class.get("shared_du").and_then(P::as_u64).unwrap_or(0);
+                                }
+                            }
                         }
                     }
                     row.items = items;
@@ -534,6 +583,9 @@ pub fn view(path: &Path) -> io::Result<ViewOutcome> {
                     shared_du: 0,
                     since: value.get("since").and_then(P::as_i64),
                     interrupted: false,
+                    mode: mode_of(&value),
+                    targets_count: 0,
+                    skipped_count: 0,
                 };
                 if !rows.contains_key(&run_id) {
                     order.push(run_id.clone());
@@ -691,6 +743,117 @@ mod tests {
         assert!(outcome.runs.is_empty(), "no cargogc events were written");
         assert_eq!(outcome.foreign, 1, "the foreign summary line must be counted");
         assert_eq!(outcome.unparsable, 1, "the truncated line must be counted");
+    }
+
+    #[test]
+    fn view_reads_a_scan_run_next_to_a_single_target_run() {
+        let dir = std::env::temp_dir().join(format!("cargogc-ledger-scan-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("runs.jsonl");
+
+        // A single-target run, the original shape.
+        append(
+            &path,
+            &J::obj(vec![
+                ("evt", J::S("start".into())),
+                ("run_id", J::S("run-single".into())),
+                ("ts", J::S("2026-10-10T00:00:00Z".into())),
+                ("op", J::S("apply".into())),
+                ("target", J::S("/one/target".into())),
+            ])
+            .render(),
+        )
+        .unwrap();
+        append(
+            &path,
+            &J::obj(vec![
+                ("evt", J::S("finish".into())),
+                ("run_id", J::S("run-single".into())),
+                ("ts", J::S("2026-10-10T00:00:01Z".into())),
+                ("verdict", J::S("applied".into())),
+                ("classes", J::A(vec![class("dead", 2, 100, 120, 20)])),
+            ])
+            .render(),
+        )
+        .unwrap();
+
+        // A scan run: one target applied, one skipped.
+        append(
+            &path,
+            &J::obj(vec![
+                ("evt", J::S("start".into())),
+                ("run_id", J::S("run-scan".into())),
+                ("ts", J::S("2026-10-10T00:01:00Z".into())),
+                ("op", J::S("apply".into())),
+                ("mode", J::S("scan".into())),
+            ])
+            .render(),
+        )
+        .unwrap();
+        append(
+            &path,
+            &J::obj(vec![
+                ("evt", J::S("finish".into())),
+                ("run_id", J::S("run-scan".into())),
+                ("ts", J::S("2026-10-10T00:01:02Z".into())),
+                ("verdict", J::S("applied".into())),
+                ("mode", J::S("scan".into())),
+                (
+                    "targets",
+                    J::A(vec![
+                        J::obj(vec![
+                            ("target", J::S("/a/target".into())),
+                            ("verdict", J::S("applied".into())),
+                            ("classes", J::A(vec![class("superseded-root", 3, 500, 600, 100)])),
+                        ]),
+                        J::obj(vec![
+                            ("target", J::S("/b/target".into())),
+                            ("verdict", J::S("skipped".into())),
+                            ("skipped", J::obj(vec![("reason", J::S("lock-held".into()))])),
+                        ]),
+                    ]),
+                ),
+            ])
+            .render(),
+        )
+        .unwrap();
+
+        // A record another writer put in the same file, and a truncated line.
+        append(&path, "{\"ts\":\"2026-10-10T00:02:00Z\",\"op\":\"sweep\",\"verdict\":\"ok\"}").unwrap();
+        append(&path, "{\"evt\":\"start\"").unwrap();
+
+        let outcome = view(&path).unwrap();
+        assert_eq!(outcome.foreign, 1, "another writer's record is counted, not shown");
+        assert_eq!(outcome.unparsable, 1, "a truncated line is counted");
+        assert_eq!(outcome.runs.len(), 2, "both shapes must be visible in one view");
+
+        let single = &outcome.runs[0];
+        assert_eq!(single.mode, "single");
+        assert_eq!(single.items, 2);
+        assert_eq!(single.freed_du, 100);
+        assert_eq!(single.targets_count, 0);
+
+        let scan = &outcome.runs[1];
+        assert_eq!(scan.mode, "scan");
+        assert_eq!(scan.targets_count, 2);
+        assert_eq!(scan.skipped_count, 1);
+        assert_eq!(scan.items, 3, "only the applied target contributes items");
+        assert_eq!(scan.freed_du, 500);
+        assert_eq!(scan.logical, 600);
+        assert_eq!(scan.shared_du, 100);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn class(kind: &str, items: u64, du: u64, logical: u64, shared: u64) -> J {
+        J::obj(vec![
+            ("kind", J::S(kind.to_string())),
+            ("items", J::U(items)),
+            ("bytes_du", J::U(du)),
+            ("bytes_logical", J::U(logical)),
+            ("shared_du", J::U(shared)),
+        ])
     }
 
     #[test]

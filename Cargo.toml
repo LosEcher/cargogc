@@ -1,6 +1,6 @@
 [package]
 name = "cargogc"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "Reclaim the cargo build caches cargo will never read again, with inode-honest accounting and a fail-closed build gate. The judgement is a build record, not an age."
 license = "MIT"
@@ -11,3 +11,12 @@ exclude = [".github/", "scripts/"]
 
 [dependencies]
 libc = "0.2"
+
+# Dev incremental is OFF on purpose, and this repo is not an exception to its own thesis:
+# measured 2026-10-10 across 12 cargo targets on this machine, the 10 repos that set this to
+# false had 0 incremental roots, while the two that left it on (cantool — deliberately, for
+# dev speed — and this one, for one day) had 236 and 25. A tool repo's loop is change → test →
+# release: it does not need "edit one line, recompile one crate" seconds, and it does not need
+# to leave state that only a sweep can reclaim. See docs: the umbrella's CARGOGC-DESIGN §8.
+[profile.dev]
+incremental = false
