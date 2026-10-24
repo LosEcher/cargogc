@@ -32,7 +32,8 @@ jobs:
             target: aarch64-apple-darwin
             asset: cargogc-darwin-arm64
             apt: ""
-          - os: macos-13
+          # macos-13 镜像已被 GitHub 下线（任务会一直排队），换成仍可用的 Intel 镜像。
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             asset: cargogc-darwin-x86_64
             apt: ""
